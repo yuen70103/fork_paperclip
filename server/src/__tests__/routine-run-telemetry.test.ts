@@ -5,11 +5,14 @@ import {
   agents,
   companies,
   createDb,
+  documentRevisions,
+  documents,
   executionWorkspaces,
   heartbeatRuns,
   issues,
   projectWorkspaces,
   projects,
+  routineDocuments,
   routineRuns,
   routines,
   routineTriggers,
@@ -18,6 +21,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import { scopedTelemetryCompanyId } from "../telemetry-company-scope.js";
 
 const mockTelemetryClient = vi.hoisted(() => ({ track: vi.fn() }));
 const mockTrackRoutineRun = vi.hoisted(() => vi.fn());
@@ -54,7 +58,10 @@ describeEmbeddedPostgres("routine run telemetry", () => {
     vi.clearAllMocks();
     await db.delete(routineRuns);
     await db.delete(routineTriggers);
+    await db.delete(routineDocuments);
     await db.delete(routines);
+    await db.delete(documents);
+    await db.delete(documentRevisions);
     await db.delete(heartbeatRuns);
     await db.delete(issues);
     await db.delete(executionWorkspaces);
@@ -78,6 +85,7 @@ describeEmbeddedPostgres("routine run telemetry", () => {
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
     });
 
     await db.insert(agents).values({
@@ -142,6 +150,7 @@ describeEmbeddedPostgres("routine run telemetry", () => {
         status: "active",
         concurrencyPolicy: "coalesce_if_active",
         catchUpPolicy: "skip_missed",
+        variables: [],
       },
       {},
     );
@@ -159,5 +168,15 @@ describeEmbeddedPostgres("routine run telemetry", () => {
       source: "manual",
       status: "issue_created",
     });
+  });
+
+  it("tracks a routine run in the routine's company scope", async () => {
+    const { routine, svc } = await seedFixture();
+    const scopedCompanies: Array<string | undefined> = [];
+    mockTrackRoutineRun.mockImplementationOnce(() => scopedCompanies.push(scopedTelemetryCompanyId()));
+
+    await svc.runRoutine(routine.id, { source: "manual" });
+
+    expect(scopedCompanies).toEqual([routine.companyId]);
   });
 });

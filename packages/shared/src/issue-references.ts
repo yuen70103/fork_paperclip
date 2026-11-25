@@ -1,4 +1,4 @@
-export const ISSUE_REFERENCE_IDENTIFIER_RE = /^[A-Z]+-\d+$/;
+export const ISSUE_REFERENCE_IDENTIFIER_RE = /^[A-Z][A-Z0-9]*-\d+$/;
 
 export interface IssueReferenceMatch {
   index: number;
@@ -7,7 +7,7 @@ export interface IssueReferenceMatch {
   matchedText: string;
 }
 
-const ISSUE_REFERENCE_TOKEN_RE = /https?:\/\/[^\s<>()]+|\/[^\s<>()]+|[A-Z]+-\d+/gi;
+const ISSUE_REFERENCE_TOKEN_RE = /https?:\/\/[^\s<>()]+|\/[^\s<>()]+|[A-Z][A-Z0-9]*-\d+/gi;
 
 function preserveNewlinesAsWhitespace(value: string) {
   return value.replace(/[^\n]/g, " ");
@@ -111,6 +111,7 @@ export function parseIssueReferenceHref(href: string): { identifier: string } | 
   } catch {
     return null;
   }
+  if (url.protocol !== "http:" && url.protocol !== "https:") return null;
 
   const segments = url.pathname
     .split("/")

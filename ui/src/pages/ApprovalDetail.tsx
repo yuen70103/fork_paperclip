@@ -1,3 +1,5 @@
+import { describeError } from "../api/errors";
+import { AgentIdentity } from "@/components/AgentIdentity";
 import { useEffect, useMemo, useState } from "react";
 import { Link, useNavigate, useParams, useSearchParams } from "@/lib/router";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -15,6 +17,8 @@ import { Textarea } from "@/components/ui/textarea";
 import { CheckCircle2, ChevronRight, Sparkles } from "lucide-react";
 import type { ApprovalComment } from "@paperclipai/shared";
 import { MarkdownBody } from "../components/MarkdownBody";
+import { ANALYTICS_MASK_CLASS } from "@/lib/analytics/privacy";
+import { cn } from "@/lib/utils";
 
 export function ApprovalDetail() {
   const { approvalId } = useParams<{ approvalId: string }>();
@@ -91,7 +95,7 @@ export function ApprovalDetail() {
       refresh();
       navigate(`/approvals/${approvalId}?resolved=approved`, { replace: true });
     },
-    onError: (err) => setError(err instanceof Error ? err.message : "Approve failed"),
+    onError: (err) => setError(describeError(err, { action: "approve this request" }).body),
   });
 
   const rejectMutation = useMutation({
@@ -100,7 +104,7 @@ export function ApprovalDetail() {
       setError(null);
       refresh();
     },
-    onError: (err) => setError(err instanceof Error ? err.message : "Reject failed"),
+    onError: (err) => setError(describeError(err, { action: "reject this request" }).body),
   });
 
   const revisionMutation = useMutation({
@@ -109,7 +113,7 @@ export function ApprovalDetail() {
       setError(null);
       refresh();
     },
-    onError: (err) => setError(err instanceof Error ? err.message : "Revision request failed"),
+    onError: (err) => setError(describeError(err, { action: "request a revision" }).body),
   });
 
   const resubmitMutation = useMutation({
@@ -118,7 +122,7 @@ export function ApprovalDetail() {
       setError(null);
       refresh();
     },
-    onError: (err) => setError(err instanceof Error ? err.message : "Resubmit failed"),
+    onError: (err) => setError(describeError(err, { action: "resubmit this request" }).body),
   });
 
   const addCommentMutation = useMutation({
@@ -156,8 +160,8 @@ export function ApprovalDetail() {
       ? {
           label:
             (linkedIssues?.length ?? 0) > 1
-              ? "Review linked issues"
-              : "Review linked issue",
+              ? "Review linked tasks"
+              : "Review linked task",
           to: `/issues/${primaryLinkedIssue.identifier ?? primaryLinkedIssue.id}`,
         }
       : linkedAgentId
@@ -183,7 +187,7 @@ export function ApprovalDetail() {
               <div>
                 <p className="text-sm text-green-800 dark:text-green-100 font-medium">Approval confirmed</p>
                 <p className="text-xs text-green-700 dark:text-green-200/90">
-                  Requesting agent was notified to review this approval and linked issues.
+                  Requesting agent was notified to review this approval and linked tasks.
                 </p>
               </div>
             </div>
@@ -213,8 +217,8 @@ export function ApprovalDetail() {
           {approval.requestedByAgentId && (
             <div className="flex items-center gap-2">
               <span className="text-muted-foreground text-xs">Requested by</span>
-              <Identity
-                name={agentNameById.get(approval.requestedByAgentId) ?? approval.requestedByAgentId.slice(0, 8)}
+              <AgentIdentity
+                agent={agents?.find((agent) => agent.id === approval.requestedByAgentId) ?? { id: approval.requestedByAgentId, name: "Agent" }}
                 size="sm"
               />
             </div>
@@ -229,7 +233,7 @@ export function ApprovalDetail() {
             See full request
           </button>
           {showRawPayload && (
-            <pre className="text-xs bg-muted/40 rounded-md p-3 overflow-x-auto">
+            <pre className={cn("text-xs bg-muted/40 rounded-md p-3 overflow-x-auto", ANALYTICS_MASK_CLASS)}>
               {JSON.stringify(payload, null, 2)}
             </pre>
           )}
@@ -240,7 +244,7 @@ export function ApprovalDetail() {
         {error && <p className="text-sm text-destructive">{error}</p>}
         {linkedIssues && linkedIssues.length > 0 && (
           <div className="pt-2 border-t border-border/60">
-            <p className="text-xs text-muted-foreground mb-1.5">Linked Issues</p>
+            <p className="text-xs text-muted-foreground mb-1.5">Linked Tasks</p>
             <div className="space-y-1.5">
               {linkedIssues.map((issue) => (
                 <Link
@@ -255,8 +259,8 @@ export function ApprovalDetail() {
                 </Link>
               ))}
             </div>
-            <p className="text-[11px] text-muted-foreground mt-2">
-              Linked issues remain open until the requesting agent follows up and closes them.
+            <p className="text-(length:--text-micro) text-muted-foreground mt-2">
+              Linked tasks remain open until the requesting agent follows up and closes them.
             </p>
           </div>
         )}
@@ -331,8 +335,8 @@ export function ApprovalDetail() {
               <div className="flex items-center justify-between mb-1">
                 {comment.authorAgentId ? (
                   <Link to={`/agents/${comment.authorAgentId}`} className="hover:underline">
-                    <Identity
-                      name={agentNameById.get(comment.authorAgentId) ?? comment.authorAgentId.slice(0, 8)}
+                    <AgentIdentity
+                      agent={agents?.find((agent) => agent.id === comment.authorAgentId) ?? { id: comment.authorAgentId, name: "Agent" }}
                       size="sm"
                     />
                   </Link>

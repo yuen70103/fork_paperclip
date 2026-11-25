@@ -3,9 +3,9 @@
 Status: proposed complete spec for the post-V1 plugin system
 
 This document is the complete specification for Paperclip's plugin and extension architecture.
-It expands the brief plugin notes in [doc/SPEC.md](../SPEC.md) and should be read alongside the comparative analysis in [doc/plugins/ideas-from-opencode.md](./ideas-from-opencode.md).
+It should be read alongside the comparative analysis in [doc/plugins/ideas-from-opencode.md](./ideas-from-opencode.md).
 
-This is not part of the V1 implementation contract in [doc/SPEC-implementation.md](../SPEC-implementation.md).
+This is not part of the V1 implementation contract.
 It is the full target architecture for the plugin system that should follow V1.
 
 ## Current implementation caveats
@@ -27,12 +27,48 @@ Current limitations to keep in mind:
 - Published npm packages are the intended install artifact for deployed plugins.
 - The repo example plugins under `packages/plugins/examples/` are development conveniences. They work from a source checkout and should not be assumed to exist in a generic published build unless they are explicitly shipped with that build.
 - Dynamic plugin install is not yet cloud-ready for horizontally scaled or ephemeral deployments. There is no shared artifact store, install coordination, or cross-node distribution layer yet.
-- The current runtime does not yet ship a real host-provided plugin UI component kit, and it does not support plugin asset uploads/reads. Treat those as future-scope ideas in this spec, not current implementation promises.
+- The current runtime ships a small host-provided plugin UI component kit through `@paperclipai/plugin-sdk/ui`, but does not support plugin asset uploads/reads yet. Treat plugin asset APIs as future-scope ideas, not current implementation promises.
 - Scoped plugin API routes are JSON-only and must be declared in `apiRoutes`.
   They mount under `/api/plugins/:pluginId/api/*`; plugins cannot shadow core
   API routes.
 
 In practice, that means the current implementation is a good fit for local development and self-hosted persistent deployments, but not yet for multi-instance cloud plugin distribution.
+
+### Managed image packages
+
+Managed Cloud provisions only plugins selected from the current release image
+catalog. A Cloud tenant token or managed configuration keeps this image-only
+policy active. Without an explicit selected package list, Cloud selects no
+packages and cannot fall back to local installs. An explicit operator-managed
+list also keeps this policy active outside Cloud. The database registration's
+plugin key, package name, version and
+approved manifest identify that package. Its legacy `packagePath` remains for
+local/self-hosted compatibility; Cloud never uses that path to locate code.
+Workers, plugin migrations and UI files resolve through the same current-image
+package resolver. Cloud does not install npm dependencies, build packages, use
+the development UI proxy, or fall back to a server home directory.
+
+Prebuilt workers use the current release's baked CLI `tsx` loader for the SDK's
+workspace TypeScript dependencies. The loader is located from the owning server
+package in both regular and bundled server layouts. Missing loaders and loader
+links outside the release's CLI or root `node_modules` fail activation. This
+loads image-supplied code without installing dependencies or building packages.
+
+Equivalent packages at different image roots reuse the existing registration,
+configuration, approval status and company scopes without rewriting its stored
+path. Concurrent first registration of the same package retains one plugin ID.
+Conflicting package identities fail explicitly. Normal maintenance boot retains
+the existing bundled manifest/version reconciliation and approval gates.
+
+`createBundledPluginPackageResolver(...).inspect(registration, verifiedManifest)`
+is a read-only qualification hook. Resolve the current image path, load its
+manifest with the validated plugin loader, and inspect the registration before
+normal boot reconciliation. Missing manifest evidence and incompatible packages
+produce explicit blockers. Distribution packages retain their catalog digest
+verification; built-in packages trust the immutable release image and must bump
+their version when their code changes. Qualification supports identical package
+sets only. This package-resolution boundary does not coordinate workers,
+background jobs, or deployment overlap between servers.
 
 ## 1. Scope
 
@@ -245,10 +281,10 @@ This on-disk model is the reason the current implementation expects a persistent
 Paperclip should add CLI commands:
 
 - `pnpm paperclipai plugin list`
-- `pnpm paperclipai plugin install <package[@version]>`
-- `pnpm paperclipai plugin uninstall <plugin-id>`
-- `pnpm paperclipai plugin upgrade <plugin-id> [version]`
-- `pnpm paperclipai plugin doctor <plugin-id>`
+- `npx paperclipai plugin install <package[@version]>`
+- `npx paperclipai plugin uninstall <plugin-id>`
+- `npx paperclipai plugin upgrade <plugin-id> [version]`
+- `npx paperclipai plugin doctor <plugin-id>`
 
 These commands are instance-level operations.
 
@@ -319,7 +355,10 @@ export interface PaperclipPluginManifestV1 {
   version: string;
   displayName: string;
   description: string;
+  author: string;
   categories: Array<"connector" | "workspace" | "automation" | "ui">;
+  minimumHostVersion?: string;
+  /** @deprecated Use `minimumHostVersion` instead. Retained for backwards compatibility. */
   minimumPaperclipVersion?: string;
   capabilities: string[];
   entrypoints: {
@@ -335,29 +374,87 @@ export interface PaperclipPluginManifestV1 {
     description: string;
     parametersSchema: JsonSchema;
   }>;
+  database?: PluginDatabaseDeclaration;
+  apiRoutes?: PluginApiRouteDeclaration[];
+  environmentDrivers?: PluginEnvironmentDriverDeclaration[];
+  agents?: PluginManagedAgentDeclaration[];
+  projects?: PluginManagedProjectDeclaration[];
+  routines?: PluginManagedRoutineDeclaration[];
+  skills?: PluginManagedSkillDeclaration[];
+  localFolders?: PluginLocalFolderDeclaration[];
+  /** Legacy top-level launcher declarations. Prefer `ui.launchers` for new manifests. */
+  launchers?: PluginLauncherDeclaration[];
   ui?: {
+    launchers?: PluginLauncherDeclaration[];
     slots: Array<{
-      type: "page" | "detailTab" | "dashboardWidget" | "sidebar" | "settingsPage";
+      type: "page"
+        | "detailTab"
+        | "taskDetailView"
+        | "dashboardWidget"
+        | "sidebar"
+        | "routeSidebar"
+        | "sidebarPanel"
+        | "projectSidebarItem"
+        | "globalToolbarButton"
+        | "appShellOverlay"
+        | "toolbarButton"
+        | "contextMenuItem"
+        | "commentAnnotation"
+        | "commentContextMenuItem"
+        | "settingsPage"
+        | "companySettingsPage";
       id: string;
       displayName: string;
       /** Which export name in the UI bundle provides this component */
       exportName: string;
       /** For detailTab: which entity types this tab appears on */
       entityTypes?: Array<"project" | "issue" | "agent" | "goal" | "run">;
+      /** Optional agent detail tab offered beside a task for manual selection.
+       * Declared board GET route scoped to agent :entityId controls readiness for automatic opening.
+       */
+      /** Agent-only detail tab: require this plugin environment driver key. */
+      agentEnvironmentDriver?: string;
+      taskSidePanel?: {
+        availabilityPath: string;
+        /** Match runtime.activity.recorded for automatic opening; manual views need no mapping. */
+        activation?: { namespace: string; activityKey: string };
+      };
+      /** For page and companySettingsPage: single route segment */
+      routePath?: string;
     }>;
   };
 }
 ```
+
+Agent detail tabs can declare `agentEnvironmentDriver` to restrict settings navigation,
+direct plugin views, and manual task side panels to agents that use that driver.
+The host matches the effective agent environment's plugin key and driver key.
+An agent with no explicit environment inherits the instance default. Missing or
+unavailable configuration hides the restricted view. A transient connection
+failure preserves the last known configuration. Eligibility does not depend
+on runtime readiness, agent lifecycle state, or automatic panel activation.
 
 Rules:
 
 - `id` must be globally unique
 - `id` should normally equal the npm package name
 - `apiVersion` must match the host-supported plugin API version
+- `minimumHostVersion` is preferred, with `minimumPaperclipVersion` retained for
+  backwards compatibility
 - `capabilities` must be static and install-time visible
 - config schema must be JSON Schema compatible
 - `entrypoints.ui` points to the directory containing the built UI bundle
 - `ui.slots` declares which extension slots the plugin fills, so the host knows what to mount without loading the bundle eagerly; each slot references an `exportName` from the UI bundle
+- declare managed declarations with the matching `*.managed` capability:
+  - `agents` → `agents.managed`
+  - `projects` → `projects.managed`
+  - `routines` → `routines.managed`
+  - `skills` → `skills.managed`
+- an `environmentDrivers` entry with `kind: "sandbox_provider"` declares sandbox
+  capabilities through `sandboxCapabilities`. See the
+  [sandbox provider capability contract](./SANDBOX_PROVIDER_CAPABILITIES.md) for
+  the supported keys, the worker-method prerequisites, and the narrowing and
+  failure rules.
 
 ## 11. Agent Tools
 
@@ -399,6 +496,70 @@ Plugin tools appear in the agent's tool list alongside core tools but are visual
 - Tool execution is subject to the same timeout and resource limits as other plugin worker calls.
 - Tool results are included in run logs.
 
+## 11A. Connectors
+
+A plugin with the `connectors.provide` capability can add connector types to
+the Connectors catalog. It declares them as `apps` in its manifest. Each entry
+uses the built-in app-definition schema
+(`packages/shared/src/app-definitions/*.json`, validated by
+`appDefinitionSchema`), so a built-in connector can be copied into a plugin
+unchanged.
+
+```ts
+apps?: AppDefinition[];
+```
+
+- The host namespaces each slug by plugin key (`pluginAppSlug(pluginKey, slug)`),
+  so a plugin app never shadows a built-in app or another plugin's app.
+- A method can use the `mcp_remote` or `local_stdio` transport. The host then
+  does setup, OAuth, discovery, grants, policies, approvals and audit exactly as
+  for a built-in connector. Transports that need provider code in the host
+  (REST adapters, chat channels, AI runtimes) are rejected.
+- A method can use `transport: "plugin"`: the plugin worker serves its tools.
+  It declares `tools` (`{ kind: "static", list }` with a `risk` per tool, or
+  `{ kind: "dynamic" }` served by `ctx.connectors.listTools`) and optionally a
+  `settingsSchema` for per-connection settings. Tool names use `[a-z0-9_]`.
+  The method, or a single static tool, can declare `timeoutMs` (an integer
+  from 1000 to 60000) for how long the gateway waits for a tool call; a
+  tool's value overrides its method's. Without one the gateway waits 30000 ms
+  for plugin-served tools. A caller's explicit timeout still wins, capped at
+  the same 60 s ceiling. An "ask first" call that a person has approved runs
+  with the gateway's fixed 60 s approved-execution budget instead of the
+  declared value. The gateway enforces the deadline and gives the worker call
+  1 s more, so callers always see the gateway's `tool_timeout`. Worker calls
+  cannot be cancelled, so a timed-out call may still finish in the worker;
+  write tools should be idempotent on their arguments so a retry is safe.
+  Authentication is `none` or `api_key`. The gateway keeps every decision
+  (grant, policy, approval, rate limit, audit) and calls the worker's
+  `executeTool` with `runContext.connection` (`id`, `appSlug`, `methodKey`,
+  `grantId`, `settings`, and the call's `credential`). The worker never reads
+  the vault and never sees another connection's credential. A stopped worker
+  is a retryable `plugin_connector_unavailable` error.
+- Legacy top-level `tools` become one implicit connector (slug `default`, named
+  after the plugin, no authentication). Its tools keep their names and
+  handlers. A one-time migration recorded each plugin installed at upgrade
+  time; the host gives each such plugin, per company, one connection installed
+  for the whole company, so existing agents keep exactly their tools.
+- A definition can declare `reviewedTools` (read, write and destructive tool
+  names, and the risk for unlisted tools). The host classifies the connector's
+  tools from it wherever the definition is installed.
+- The manifest validator rejects apps without `connectors.provide`, duplicate
+  slugs, and host-derived fields (`plugin`, `aiConnectionRouter`,
+  `experimentalFeatureKey`, `availability`).
+
+Activation rules:
+
+1. Installing or enabling the plugin grants no tools. It only adds its connector
+   types to the catalog.
+2. Connecting an account grants no tools.
+3. An agent gets a connector's tools only from a connection installed for that
+   agent, or for the whole company. Discovery and invocation both enforce this.
+4. While the plugin is not `ready`, or after an upgrade removes the app, its
+   connector types and connections are hidden from the Connectors APIs and reach
+   no agent. Settings, credentials, installs and grants are kept and come back
+   unchanged when the plugin is ready again. Uninstalling archives the
+   connections, revokes their grants and deletes their owned credentials.
+
 ## 12. Runtime Model
 
 ## 12.1 Process Model
@@ -432,6 +593,22 @@ The host is responsible for:
 - secret resolution
 - UI route registration
 
+An activation whose worker `initialize` call times out is transient. The host
+removes the failed worker, keeps the plugin `ready`, and retries the activation
+after 5, 15, 45 and 120 seconds on the shared work scheduler. While it retries,
+the plugin's `lastError` starts with `Activation timed out` and names the next
+retry; a successful retry clears it. Status writes are conditional on the
+expected current status, so a disable or uninstall during a retry wins. Server
+shutdown cancels pending retries and waits for running ones. Runs that need the plugin see a
+worker that is not running, which setup retries within its bounded budget. After
+the last retry, the plugin becomes `error` with that same prefix. A run that
+needs the plugin then re-activates it on demand, at most once a minute. A run that resumes its exact sandbox lease after a
+restart waits up to 60 seconds for a re-activating sandbox provider's worker
+before it reports the worker unavailable. Any
+other activation failure, such as a bad manifest, a worker that exits during
+`initialize`, or a version mismatch, makes the plugin `error` at once. The next
+server boot retries it once.
+
 ## 12.3 Worker Responsibilities
 
 The plugin worker is responsible for:
@@ -453,6 +630,7 @@ If a worker fails:
 - keep the rest of the instance running
 - retry start with bounded backoff
 - do not drop other plugins or core services
+- a bundled plugin (shipped with the release image) that is still `error` at the next server boot is moved back to `ready` once per boot, so the startup loader gets a fresh activation attempt; an operator-`disabled` plugin is never touched
 
 ## 12.5 Graceful Shutdown Policy
 
@@ -519,11 +697,12 @@ Returns:
 
 ### 13.4 `configChanged`
 
-Called when the operator updates the plugin's instance config at runtime.
+Called when the operator updates a plugin config for a specific company at runtime.
 
 Input includes:
 
 - new resolved config
+- `companyId` for the company-scoped config row
 
 If the worker implements this method, it applies the new config without restarting. If the worker does not implement this method, the host restarts the worker process with the new config (graceful shutdown then restart).
 
@@ -593,6 +772,7 @@ The host provides:
 - tool name (without plugin namespace prefix)
 - parsed parameters matching the tool's declared schema
 - run context: agent ID, run ID, company ID, project ID
+  (the project ID is an empty string when the run has no project)
 
 The worker executes the tool and returns a typed result (string content, structured data, or error).
 
@@ -631,6 +811,22 @@ Plugins that need filesystem, git, terminal, or process operations handle those 
 
 Trusted orchestration plugins can create and update Paperclip issues through `ctx.issues` instead of importing server internals. The public issue contract includes parent/project/goal links, board or agent assignees, blocker IDs, labels, billing code, request depth, execution workspace inheritance, and plugin origin metadata.
 
+Plugins that perform durable work should declare managed Paperclip resources rather than using private plugin state:
+
+- `agents` + `ctx.agents.managed.*` for named, invokable operators (`agents.managed` required)
+- `projects` + `ctx.projects.managed.*` for stable, scoped issue/workspace ownership (`projects.managed` required)
+- `routines` + `ctx.routines.managed.*` for schedule/webhook/manual execution with issue trails (`routines.managed` required)
+- `skills` + `ctx.skills.managed.*` for reusable agent capabilities (`skills.managed` required)
+
+The LLM Wiki plugin is the current reference for this pattern: it declares managed
+agents, projects, routines, and skills in manifest, reconciles them per company,
+and uses managed routines for periodic wiki maintenance and ingest operations.
+Content-oriented plugins should follow the same model instead of running
+unmanaged background loops: make the LLM-facing worker an operator-visible
+managed agent, attach reusable prompt/tool guidance as managed skills, keep
+operation issues in a managed project, and drive recurring work through managed
+routines.
+
 Origin rules:
 
 - Built-in core issues keep built-in origins such as `manual` and `routine_execution`.
@@ -652,6 +848,7 @@ Governance helpers:
 - `ctx.issues.assertCheckoutOwner({ issueId, companyId, actorAgentId, actorRunId })` lets plugin actions preserve agent-run checkout ownership.
 - `ctx.issues.requestWakeup(issueId, companyId, options)` requests assignment wakeups through host heartbeat semantics, including terminal-status, blocker, assignee, and budget hard-stop checks.
 - `ctx.issues.requestWakeups(issueIds, companyId, options)` applies the same host-owned wakeup semantics to a batch and may use an idempotency key prefix for stable coordinator retries.
+- `ctx.issues.createComment(issueId, body, companyId, options)` posts a comment attributed to the plugin's own agent by default (`options.authorAgentId`). Passing `options.actorUserId` instead attributes the comment to that human company member — this requires `issue.comments.create_human_attributed` in addition to `issue.comments.create`, and the host independently verifies `actorUserId` is an active human member of the company before applying it, so a plugin can never forge attribution to an arbitrary or inactive user. A human-attributed comment on a non-terminal-status issue with an assignee also triggers the same assignee wakeup a board user's comment gets.
 
 Plugin-originated issue, relation, document, comment, and wakeup mutations must write activity entries with `actorType: "plugin"` and details fields for `sourcePluginId`, `sourcePluginKey`, `initiatingActorType`, `initiatingActorId`, and `initiatingRunId` when a user or agent run initiated the plugin work.
 
@@ -678,7 +875,10 @@ export { z } from "zod";
 export interface PluginContext {
   manifest: PaperclipPluginManifestV1;
   config: {
-    get(): Promise<Record<string, unknown>>;
+    get(companyId: string): Promise<Record<string, unknown>>;
+  };
+  secrets: {
+    resolve(secretRef: { type: "secret_ref"; secretId: string; version?: number | "latest" }, options: { companyId: string; configPath?: string }): Promise<string>;
   };
   events: {
     on(name: string, fn: (event: unknown) => Promise<void>): void;
@@ -746,20 +946,39 @@ The host enforces capabilities in the SDK layer and refuses calls outside the gr
 - `activity.read`
 - `costs.read`
 - `issues.orchestration.read`
+- `database.namespace.read`
 
 ### Data Write
 
 - `issues.create`
 - `issues.update`
 - `issue.comments.create`
+- `issue.comments.create_human_attributed`
+- `issue.interactions.create`
 - `issue.documents.write`
 - `issue.relations.write`
 - `issues.checkout`
 - `issues.wakeup`
-- `assets.write`
-- `assets.read`
 - `activity.log.write`
 - `metrics.write`
+- `telemetry.track`
+- `assets.read`
+- `assets.write`
+- `database.namespace.migrate`
+- `database.namespace.write`
+- `goals.create`
+- `goals.update`
+- `projects.managed`
+- `routines.managed`
+- `skills.managed`
+- `agents.managed`
+- `agents.pause`
+- `agents.resume`
+- `agents.invoke`
+- `agent.sessions.create`
+- `agent.sessions.list`
+- `agent.sessions.send`
+- `agent.sessions.close`
 
 ### Plugin State
 
@@ -772,12 +991,18 @@ The host enforces capabilities in the SDK layer and refuses calls outside the gr
 - `events.emit`
 - `jobs.schedule`
 - `webhooks.receive`
+- `local.folders`
 - `http.outbound`
 - `secrets.read-ref`
+- `environment.drivers.register`
 
 ### Agent Tools
 
 - `agent.tools.register`
+
+### Connectors
+
+- `connectors.provide`
 
 ### UI
 
@@ -786,6 +1011,7 @@ The host enforces capabilities in the SDK layer and refuses calls outside the gr
 - `ui.page.register`
 - `ui.detailTab.register`
 - `ui.dashboardWidget.register`
+- `ui.commentAnnotation.register`
 - `ui.action.register`
 
 ## 15.2 Forbidden Capabilities
@@ -894,6 +1120,7 @@ Job rules:
 3. The host prevents overlapping execution of the same plugin/job combination unless explicitly allowed later.
 4. Every job run is recorded in Postgres.
 5. Failed jobs are retryable.
+6. For recurring business workflows that should create visible Paperclip work, prefer managed routines and managed resources over jobs. Jobs remain useful for private plugin-runtime maintenance tasks.
 
 ## 18. Webhooks
 
@@ -976,12 +1203,22 @@ export function DashboardWidget({ context }: PluginWidgetProps) {
 
 The SDK includes a `ui` subpath export that plugin frontends import. This subpath provides:
 
-- **Bridge hooks**: `usePluginData(key, params)`, `usePluginAction(key)`, `useHostContext()`
+- **Bridge hooks**: `usePluginData(key, params)`, `usePluginAction(key)`, `useHostContext()`, `useHostNavigation()`
 - **Design tokens**: colors, spacing, typography, shadows matching the host theme
 - **Shared components**: `MetricCard`, `StatusBadge`, `DataTable`, `LogView`, `ActionBar`, `Spinner`, etc.
 - **Type definitions**: `PluginPageProps`, `PluginWidgetProps`, `PluginDetailTabProps`
 
 Plugins are encouraged but not required to use the shared components. A plugin may render entirely custom UI as long as it communicates through the bridge.
+
+`useHostNavigation()` is the supported way for plugin UI to navigate to
+Paperclip-internal pages. It exposes `resolveHref(to)`, `navigate(to,
+options?)`, and `linkProps(to, options?)`. Plugin links should prefer
+`linkProps()` so anchors keep real `href` values for copy-link, modifier-click,
+middle-click, and open-in-new-tab behavior while plain left-clicks route through
+the host SPA router. The host resolves company-scoped paths against the active
+company prefix without double-prefixing already-prefixed paths. Plugin UI should
+not use raw same-origin `href`s or `window.location.assign()` for internal
+Paperclip navigation because those can force a full document reload.
 
 ### 19.0.2 Bundle Isolation
 
@@ -1046,6 +1283,27 @@ Plugins may add sidebar links to:
 - global plugin settings
 - company-context plugin pages
 
+### 19.5.1 Route Sidebars (`routeSidebar`)
+
+A `routeSidebar` slot supplies a contextual sidebar for a plugin page route
+(matched by `routePath`). It **coexists** with the main app sidebar rather than
+replacing it: while the route is active the host collapses the app `<Sidebar/>`
+to its 64px icon rail (still hover/peek-able) and renders the plugin's
+`routeSidebar` in a secondary pane, producing the layout
+`[ app rail ][ route sidebar ][ content ]`. The same model applies to the
+host's own company-settings sidebar.
+
+The host owns the collapse. Plugins must not mount `RequestCollapsedSidebar` or
+otherwise attempt to collapse the app sidebar from a `routeSidebar` — the host
+applies the collapse while the route is mounted and restores the previous state
+on navigation away. The collapse is a **hard invariant**: while a secondary
+sidebar is shown the app rail is forced collapsed and its expand/toggle
+affordance is hidden, *overriding* any user pin. Crucially, this force is
+ephemeral — it never mutates the user's persisted expanded/collapsed preference,
+so navigating back to a normal route restores exactly what the user chose.
+Precedence is therefore: secondary-sidebar force > explicit user pin >
+route-requested collapse (`RequestCollapsedSidebar`) > default expanded.
+
 ## 19.6 Shared Components In `@paperclipai/plugin-sdk/ui`
 
 The host SDK ships shared components that plugins can import to quickly build UIs that match the host's look and feel. These are convenience building blocks, not a requirement.
@@ -1062,6 +1320,11 @@ The host SDK ships shared components that plugins can import to quickly build UI
 | `LogView` | Scrollable log output with timestamps | Webhook deliveries, job output, process logs |
 | `JsonTree` | Collapsible JSON tree for debugging | Raw API responses, plugin state inspection |
 | `Spinner` | Loading indicator | Data fetch states |
+| `FileTree` | Host-styled file/directory tree | Wiki pages, workspace files, import previews |
+| `IssuesList` | Host issue list | Plugin pages that need a native issue view |
+| `AssigneePicker` | Host assignee picker for agents and board users | Creating issues, assigning routines, filtering work |
+| `ProjectPicker` | Host project picker | Creating issues, scoping dashboards, filtering work |
+| `ManagedRoutinesList` | Host routine list | Plugin settings pages that manage routines |
 
 Plugins may also use entirely custom components. The shared components exist to reduce boilerplate and keep visual consistency, not to limit what plugins can render.
 
@@ -1104,20 +1367,22 @@ The `@paperclipai/plugin-sdk/ui` subpath should also export an `ErrorBoundary` c
 
 ## 19.8 Plugin Settings UI
 
-Each plugin that declares an `instanceConfigSchema` in its manifest gets an auto-generated settings form at `/settings/plugins/:pluginId`. The host renders the form from the JSON Schema.
+Each plugin that declares an `instanceConfigSchema` in its manifest gets an auto-generated company-scoped settings form at `/settings/plugins/:pluginId`. The host renders the form from the JSON Schema for the selected company.
 
 The auto-generated form supports:
 
 - text inputs, number inputs, toggles, select dropdowns derived from schema types and enums
 - nested objects rendered as fieldsets
 - arrays rendered as repeatable field groups with add/remove controls
-- secret ref fields: any schema property annotated with `"format": "secret-ref"` renders as a secret picker that resolves through the Paperclip secret provider system rather than a plain text input
+- secret ref fields: any schema property annotated with `"format": "secret-ref"` renders as a secret picker that stores the shared `{ type: "secret_ref", secretId, version? }` object shape and resolves through the Paperclip secret provider system rather than a plain text input
 - validation messages derived from schema constraints (`required`, `minLength`, `pattern`, `minimum`, etc.)
 - a "Test Connection" action if the plugin declares a `validateConfig` RPC method — the host calls it and displays the result inline
 
 For plugins that need richer settings UX beyond what JSON Schema can express, the plugin may declare a `settingsPage` slot in `ui.slots`. When present, the host renders the plugin's own React component instead of the auto-generated form. The plugin component communicates with its worker through the standard bridge to read and write config.
 
 Both approaches coexist: a plugin can use the auto-generated form for simple config and add a custom settings page slot for advanced configuration or operational dashboards.
+
+For plugins that need a company-scoped settings surface, declare a `companySettingsPage` slot with a `routePath`. The host renders a sidebar item under Company Settings and mounts the component at `/:companyPrefix/company/settings/:routePath`. The page receives `companyId` and `companyPrefix` in its host context. Core settings routes such as `access`, `invites`, `environments`, and `secrets` are reserved and cannot be shadowed by plugin declarations.
 
 ## 20. Local Tooling
 
@@ -1170,11 +1435,16 @@ Indexes:
 ### `plugin_config`
 
 - `id` uuid pk
-- `plugin_id` uuid fk `plugins.id` unique not null
+- `plugin_id` uuid fk `plugins.id` not null
+- `company_id` uuid fk `companies.id` not null
 - `config_json` jsonb not null
 - `created_at` timestamptz not null
 - `updated_at` timestamptz not null
 - `last_error` text null
+
+Constraints:
+
+- unique `(plugin_id, company_id)`
 
 ### `plugin_state`
 
@@ -1312,10 +1582,11 @@ Plugin config must never persist raw secret values.
 
 Rules:
 
-1. Plugin config stores secret refs only.
-2. Secret refs resolve through the existing Paperclip secret provider system.
-3. Plugin workers receive resolved secrets only at execution time.
-4. Secret values must never be written to:
+1. Plugin config stores shared `{ type: "secret_ref", secretId, version? }` refs only. Legacy UUID string refs are rejected.
+2. Save-time validation rejects refs to secrets outside the selected company.
+3. Secret refs resolve through the existing Paperclip secret provider system using explicit `companyId`.
+4. Plugin workers receive resolved secrets only at execution time, and resolution writes `secret_access_events` with `consumerType: "plugin_worker"`.
+5. Secret values must never be written to:
    - plugin config JSON
    - activity logs
    - webhook delivery rows
@@ -1368,6 +1639,14 @@ Each plugin may expose a company-context main page:
 
 This page is where board users do most day-to-day work.
 
+## 24.4 Company Settings Plugin Page
+
+Each ready plugin may expose a company settings page:
+
+- `/:companyPrefix/company/settings/:routePath`
+
+The host adds a matching Company Settings sidebar item using the slot `displayName`. Plugin settings route segments are single-segment slugs and must not collide with core company settings pages.
+
 ## 25. Uninstall And Data Lifecycle
 
 When a plugin is uninstalled, the host must handle plugin-owned data explicitly.
@@ -1379,7 +1658,7 @@ When a plugin is uninstalled, the host must handle plugin-owned data explicitly.
 3. Plugin-owned data (`plugin_state`, `plugin_entities`, `plugin_jobs`, `plugin_job_runs`, `plugin_webhook_deliveries`, `plugin_config`) is retained for a configurable grace period (default: 30 days).
 4. During the grace period, the operator can reinstall the same plugin and recover its state.
 5. After the grace period, the host purges all plugin-owned data for the uninstalled plugin.
-6. The operator may force-purge immediately via CLI: `pnpm paperclipai plugin purge <plugin-id>`.
+6. The operator may force-purge immediately via CLI: `npx paperclipai plugin purge <plugin-id>`.
 
 ### 25.2 Upgrade Data Considerations
 
@@ -1439,12 +1718,13 @@ When a plugin is upgraded at runtime:
 
 #### 25.4.4 Hot Config Change
 
-When an operator updates a plugin's instance config at runtime:
+When an operator updates a plugin config for a company at runtime:
 
-1. The host writes the new config to `plugin_config`.
-2. The host sends a `configChanged` notification to the running worker via IPC.
-3. The worker receives the new config through `ctx.config` and applies it without restarting. If the plugin needs to re-initialize connections (e.g. a new API token), it does so internally.
-4. If the plugin does not handle `configChanged`, the host restarts the worker process with the new config (graceful shutdown then restart).
+1. The host validates that any shared `{ type: "secret_ref", secretId, version? }` refs belong to that company, then writes the new config to `plugin_config`.
+2. The host syncs plugin secret bindings in `company_secret_bindings` under `(company_id, target_type = "plugin", target_id = plugin_id)`.
+3. The host sends a `configChanged` notification with `companyId` to the running worker via IPC.
+4. The worker reads the config through `ctx.config.get(companyId)` and applies it without restarting. If the plugin needs to re-initialize connections (e.g. a new API token), it does so internally.
+5. If the plugin does not handle `configChanged`, the host restarts the worker process; the worker must still request company-scoped config explicitly.
 
 #### 25.4.5 Frontend Cache Invalidation
 
@@ -1542,7 +1822,7 @@ expect(data.syncedCount).toBeGreaterThan(0);
 
 For developing a plugin against a running Paperclip instance:
 
-- The operator installs the plugin from a local path: `pnpm paperclipai plugin install ./path/to/plugin`
+- The operator installs the plugin from a local path: `npx paperclipai plugin install ./path/to/plugin`
 - The host watches the plugin directory for changes and restarts the worker on rebuild.
 - `devUiUrl` in plugin config can point to a local Vite dev server for UI hot-reload.
 - The plugin settings page shows real-time logs from the worker for debugging.
@@ -1703,3 +1983,37 @@ Paperclip should implement:
 - strict preservation of core governance and audit rules
 
 That is the complete target design for the Paperclip plugin system.
+
+### Browser WebSocket API routes
+
+A scoped API route may declare `transport: "websocket"` with `method: "GET"`
+and `auth: "board"`. Its upgrade runs through the ordinary HTTP authentication
+and company checks and requires a trusted browser Origin. Use
+`companyResolution: { from: "agent", param: "agentId" }` to apply the existing
+`agent:read` decision to the agent selected by the path.
+
+The worker's `onApiRequest` returns `{ websocket: { url, headers } }` for an
+available upstream. The URL must use WSS. These connection details remain in
+trusted server memory and are never returned to the browser as JSON. Browser
+cookies and Origin are not forwarded. Worker response headers cannot override
+WebSocket negotiation or forwarding headers. A failure can return an HTTP error
+status without an upstream. Ordinary HTTP requests cannot open this transport.
+
+The host pipes binary frames with socket backpressure, closes both ends on
+disconnect or worker shutdown, and limits each connection to five minutes.
+Clients may reconnect; every reconnect repeats authorization and worker
+resolution. The route's worker must resolve targets from its trusted resource
+bindings rather than accepting upstream addresses from browser parameters.
+
+The transport carries opaque text and binary WebSocket frames. For example,
+a plugin can declare `/channels/:channelId` for build output, metrics, or a
+remote tool protocol. The worker receives the route key and parameters and
+selects the upstream; Core does not interpret channel contents or require an
+agent resource. WebSocket routes support query or entity-based company
+resolution; body-based resolution is rejected because browser upgrade requests
+cannot send a request body. Ordinary HTTP routes retain body-based resolution.
+
+Agent detail-tab contributions are also independent of WebSockets. Any plugin
+can mount a detail component, including a report or notes view backed by its
+normal JSON API or UI bridge. The sidebar and detail page select declared slots
+by plugin key and slot ID, with no knowledge of the component's subject.

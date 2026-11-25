@@ -10,6 +10,7 @@ import {
 describe("issue references", () => {
   it("normalizes identifiers to uppercase", () => {
     expect(normalizeIssueIdentifier("pap-123")).toBe("PAP-123");
+    expect(normalizeIssueIdentifier("pc1a2-7")).toBe("PC1A2-7");
     expect(normalizeIssueIdentifier("not-an-issue")).toBeNull();
   });
 
@@ -22,19 +23,30 @@ describe("issue references", () => {
     expect(parseIssueReferenceHref("https://paperclip.ing/projects/PAP-789")).toBeNull();
   });
 
+  it.each([
+    "javascript:alert(1)//issues/PAP-1",
+    "JavaScript:void(0)//issues/PAP-1",
+    "data:text/html,x//issues/PAP-1",
+    "vbscript:x//issues/PAP-1",
+    "file:///issues/PAP-1",
+    "blob:https://paperclip.ing/issues/PAP-1",
+  ])("rejects issue hrefs with a non-http scheme: %s", (href) => {
+    expect(parseIssueReferenceHref(href)).toBeNull();
+  });
+
   it("builds canonical issue hrefs", () => {
     expect(buildIssueReferenceHref("pap-123")).toBe("/issues/PAP-123");
   });
 
   it("finds identifiers and issue paths in plain text", () => {
-    expect(findIssueReferenceMatches("See PAP-1, /issues/PAP-2, and https://x.test/PAP/issues/pap-3.")).toEqual([
+    expect(findIssueReferenceMatches("See PAP-1, /issues/PC1A2-2, and https://x.test/PAP/issues/pc1a2-3.")).toEqual([
       { index: 4, length: 5, identifier: "PAP-1", matchedText: "PAP-1" },
-      { index: 11, length: 13, identifier: "PAP-2", matchedText: "/issues/PAP-2" },
+      { index: 11, length: 15, identifier: "PC1A2-2", matchedText: "/issues/PC1A2-2" },
       {
-        index: 30,
-        length: 31,
-        identifier: "PAP-3",
-        matchedText: "https://x.test/PAP/issues/pap-3",
+        index: 32,
+        length: 33,
+        identifier: "PC1A2-3",
+        matchedText: "https://x.test/PAP/issues/pc1a2-3",
       },
     ]);
   });

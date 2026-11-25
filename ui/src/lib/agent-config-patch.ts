@@ -1,24 +1,16 @@
-import type { Agent } from "@paperclipai/shared";
+import { ADAPTER_AGNOSTIC_KEYS, type Agent } from "@paperclipai/shared";
 
 export interface AgentConfigOverlay {
+  runner?: import("@paperclipai/shared").AgentRunnerChoice;
   identity: Record<string, unknown>;
   adapterType?: string;
   adapterConfig: Record<string, unknown>;
   heartbeat: Record<string, unknown>;
+  debug: Record<string, unknown>;
   runtime: Record<string, unknown>;
 }
 
-const ADAPTER_AGNOSTIC_KEYS = [
-  "env",
-  "promptTemplate",
-  "instructionsFilePath",
-  "cwd",
-  "timeoutSec",
-  "graceSec",
-  "bootstrapPromptTemplate",
-] as const;
-
-function omitUndefinedEntries(value: Record<string, unknown>) {
+export function omitUndefinedEntries(value: Record<string, unknown>) {
   return Object.fromEntries(
     Object.entries(value).filter(([, entryValue]) => entryValue !== undefined),
   );
@@ -26,6 +18,7 @@ function omitUndefinedEntries(value: Record<string, unknown>) {
 
 export function buildAgentUpdatePatch(agent: Agent, overlay: AgentConfigOverlay) {
   const patch: Record<string, unknown> = {};
+  if (overlay.runner !== undefined) patch.runner = overlay.runner;
 
   if (Object.keys(overlay.identity).length > 0) {
     Object.assign(patch, overlay.identity);
@@ -56,14 +49,31 @@ export function buildAgentUpdatePatch(agent: Agent, overlay: AgentConfigOverlay)
     patch.replaceAdapterConfig = true;
   }
 
-  if (Object.keys(overlay.heartbeat).length > 0) {
-    const existingRc = (agent.runtimeConfig ?? {}) as Record<string, unknown>;
-    const existingHb = (existingRc.heartbeat ?? {}) as Record<string, unknown>;
-    patch.runtimeConfig = { ...existingRc, heartbeat: { ...existingHb, ...overlay.heartbeat } };
-  }
+  Object.assign(patch, overlay.runtime);
 
-  if (Object.keys(overlay.runtime).length > 0) {
-    Object.assign(patch, overlay.runtime);
+  if (
+    Object.keys(overlay.heartbeat).length > 0
+    || Object.keys(overlay.debug).length > 0
+  ) {
+    const existingRc = (patch.runtimeConfig ?? agent.runtimeConfig ?? {}) as Record<string, unknown>;
+    const nextRuntimeConfig: Record<string, unknown> = { ...existingRc };
+
+    if (Object.keys(overlay.heartbeat).length > 0) {
+      const existingHb = (existingRc.heartbeat ?? {}) as Record<string, unknown>;
+      nextRuntimeConfig.heartbeat = { ...existingHb, ...overlay.heartbeat };
+    }
+
+    if (Object.keys(overlay.debug).length > 0) {
+      const existingDebug = (existingRc.debug ?? {}) as Record<string, unknown>;
+      const nextDebug = omitUndefinedEntries({ ...existingDebug, ...overlay.debug });
+      if (Object.keys(nextDebug).length === 0) {
+        delete nextRuntimeConfig.debug;
+      } else {
+        nextRuntimeConfig.debug = nextDebug;
+      }
+    }
+
+    patch.runtimeConfig = nextRuntimeConfig;
   }
 
   return patch;
